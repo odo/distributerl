@@ -40,15 +40,23 @@
 %% limitations under the License.
 
 -module(merkerl).
--export([insert/2,build_tree/1,diff/2,test_merkle/0]).
+-export([insert/2,delete/2,build_tree/1,diff/2,test_merkle/0,allkeys/1]).
 
--record(merk, {nodetype,          % atom: expected values are 'leaf' or 'inner'
-               key=undefined,     % if nodetype=leaf, then this is binary/160
-                                  % (keys are 160b binaries)
-	       hashval,           % hash of value if leaf, of children if inner
-	       offset=undefined,  % if inner, then offset to reach here
-	       children=undefined % if nodetype=inner, then this is orddict
+% NOTE: userdata is the user-exposed key, 'key' is internal-only
+-record(merk, {nodetype,           % atom: expected values are 'leaf' or 'inner'
+               key=undefined,      % if nodetype=leaf, then this is binary/160
+                                   % (keys are 160b binaries)
+               userdata=undefined, % (if user specified a non-binary key)
+	       hashval,            % hash of value if leaf, of children if inner
+	       offset=undefined,   % if inner, then offset to reach here
+	       children=undefined  % if nodetype=inner, then this is orddict
 	       }).
+
+% an internal-only form
+-record(merkitem, {userdata=undefined, % for non-binary "keys"
+                   hkey,               % SHA-1 of userdata
+                   hval                % SHA-1 of value (user-supplied)
+                  }).
 
 % @type tree() = treeleaf() | treeinner() | undefined.
 % The tree() type here is used as the internal representation of
@@ -61,80 +69,113 @@
 % @type treeinner() = term().
 % Not externally useful, this is one of two record types making up tree().
 
-% @type kh() = {key(), hash()}.
-% These make up the "real" leaves in the Merkle tree.
-%
-% This is the input that most clients of the library will need to provide.
-
-% @type key() = binary().
+% @type userdata().
 % This is the key, or "name" for an object tracked by a Merkle tree.
 % It should remain constant through changes to the object it references.
-% It is expected to be a 160b binary, as produced by
-% crypto:sha/1 -- if the natural names of objects are not such values,
-% then simply crypto:sha(term_to_binary(the-name>).
 
-% @type hash() = binary().
-% This is a hash representing a unique content value for an object
-% tracked by a Merkle tree.
+% @type hash().
+% This is a unique value representing the content of an object tracked
+% by a Merkle tree.
 % It should change if the object it references changes in value.
-% It is expected to be a 160b binary, as produced by
-% crypto:sha/1 -- crypto:sha(term_to_binary(value)) is the canonical
-% way to produce a hash().
 
-% @spec build_tree([kh()]) -> tree()
-% @doc Build a Merkle tree from a list of KH's of objects.
+% @spec build_tree([{userdata(), hash()}]) -> tree()
+% @doc Build a Merkle tree from a list of pairs representing objects'
+%      names (keys) and hashes of their values.
 build_tree([{K,H}]) ->
     insert({K,H},undefined);
 build_tree([{K,H}|KHL]) ->
     insert({K,H},build_tree(KHL)).
 
-% @spec insert(KH :: kh(),T :: tree()) -> tree()
-% @doc Insert the KH for a new or changed object into T.
+% @spec delete(userdata(), tree()) -> tree()
+% @doc Remove the specified item from a tree.
+delete(Key, Tree) when is_record(Tree, merk) ->
+    mi_delete({0, #merkitem{userdata=Key,hkey=sha(Key),hval=undefined}}, Tree).
+mi_delete({Offset, MI}, Tree) ->
+    HKey = MI#merkitem.hkey,
+    case Tree#merk.nodetype of
+	leaf ->
+	    case Tree#merk.key of
+		HKey ->
+		    undefined;
+		_ ->
+		    Tree
+	    end;
+	inner ->
+            Kids = Tree#merk.children,
+            OKey = offset_key(Offset,HKey),
+            NewKids = case orddict:is_key(OKey,Kids) of
+                          false ->
+                              Kids;
+                          true ->
+                              SubTree = orddict:fetch(OKey,Kids),
+                              orddict:store(OKey,
+                                      mi_delete({Offset+8,MI},SubTree),Kids)
+                      end,
+            mkinner(Offset,NewKids)
+    end.
+    
+% @spec insert(X :: {userdata(), hash()},T :: tree()) -> tree()
+% @doc Insert the data for a new or changed object X into T.
+%
+% userdata is any term; internally the key used is produced by
+% sha1(term_to_binary(userdata)).  When the value referenced by
+% a userdata key changes, then the userdata is expected not to change.
+%
+% the hash is expected to be a value that will only compare equal
+% (==) to another userdata key's hash if the values references by
+% those two keys is also equal.
 %
 % This is used much like a typical tree-insert function.
 % To create a new tree, this can be called with T set to the atom 'undefined'.
-insert({Key,HashVal},T) ->
-    insert({0,Key,HashVal},T);
-insert({_Offset,Key,HashVal},undefined) ->
-    mkleaf(Key,HashVal);
-insert({160,Key,HashVal},_Tree) ->
+insert({Userdata, Hashval}, T) ->
+    mi_insert(#merkitem{userdata=Userdata,hkey=sha(Userdata),hval=Hashval}, T).
+mi_insert(MI,T) when is_record(MI, merkitem) ->
+    mi_insert({0,MI},T);
+mi_insert({_Offset,MI},undefined) ->
+    mkleaf(MI);
+mi_insert({160,MI},_Tree) ->
     % we're all the way deep!  replace.
-    mkleaf(Key,HashVal);
-insert({Offset,Key,HashVal},Tree) ->
+    mkleaf(MI);
+mi_insert({Offset,MI},Tree) ->
+    Key = MI#merkitem.hkey,
     case Tree#merk.nodetype of
 	leaf ->
 	    case Tree#merk.key of
 		Key -> % replacing!
-		    mkleaf(Key,HashVal);
+		    mkleaf(MI);
 		_ -> % turning a leaf into an inner
 		    K0 = orddict:new(),
 		    K1 = orddict:store(offset_key(Offset,Key),
-				       mkleaf(Key,HashVal),K0),
+				       mkleaf(MI),K0),
 		    TKey = Tree#merk.key,
 		    Kids = orddict:store(offset_key(Offset,TKey),Tree,K1),
 		    mkinner(Offset,Kids)
 	    end;
 	inner ->
-	    insert1({Offset,Key,HashVal},Tree)
+	    mi_insert1({Offset,MI},Tree)
     end.
-insert1({Offset,Key,HashVal},Tree) ->
+mi_insert1({Offset,MI},Tree) ->
     Kids = Tree#merk.children,
-    OKey = offset_key(Offset,Key),
+    OKey = offset_key(Offset,MI#merkitem.hkey),
     NewKids = case orddict:is_key(OKey,Kids) of
 		  false ->
-		      orddict:store(OKey,mkleaf(Key,HashVal),Kids);
+		      orddict:store(OKey,mkleaf(MI),Kids);
 		  true ->
 		      SubTree = orddict:fetch(OKey,Kids),
 		      orddict:store(OKey,
-				   insert({Offset+8,Key,HashVal},SubTree),Kids)
+				   mi_insert({Offset+8,MI},SubTree),Kids)
 	      end,
     mkinner(Offset,NewKids).
 
-mkleaf(Key,HashVal) ->
-    #merk{nodetype=leaf,key=Key,hashval=HashVal}.
+mkleaf(MI) ->
+    #merk{nodetype=leaf,
+          key=MI#merkitem.hkey,
+          userdata=MI#merkitem.userdata,
+          hashval=MI#merkitem.hval}.
 
 mkinner(Offset,Kids) ->
-    #merk{nodetype=inner,hashval=sha(Kids),offset=Offset,children=Kids}.
+    #merk{nodetype=inner,hashval=sha(Kids),offset=Offset,
+          children=[{K,V} || {K,V} <- Kids, V =/= undefined]}.
 
 offset_key(Offset,Key) ->
     % offset is a 8b-divisible integer from 0 to 152, inclusive
@@ -143,7 +184,7 @@ offset_key(Offset,Key) ->
     <<OKey:8/integer,_R/binary>> = RightKey,
     OKey.
 
-% @spec diff(tree(), tree()) -> [key()]
+% @spec diff(tree(), tree()) -> [userdata()]
 % @doc Find the keys of objects which differ between the two trees.
 %
 % For this purpose, "differ" means that an object either exists in
@@ -152,8 +193,10 @@ offset_key(Offset,Key) ->
 %
 % No information about the differing objects is provided except the keys.
 % (Objects with vector-clock versioning are helpful here)
-diff(TreeA,TreeB) ->
-    % return the list of 'key' fields from inner nodes that differ
+diff(undefined, TreeB) -> allkeys(TreeB);
+diff(TreeA, undefined) -> allkeys(TreeA);
+diff(TreeA,TreeB) when is_record(TreeA,merk),is_record(TreeB,merk) ->
+    % return the list of 'userdata' fields from inner nodes that differ
     lists:usort(diff1(TreeA,TreeB)).
 diff1(TreeA,TreeB) ->
     % precondition: TreeA and TreeB are both merks at same offset
@@ -169,7 +212,7 @@ diff2(TreeA,TreeB) ->
     case TreeA#merk.nodetype == TreeB#merk.nodetype andalso
 	TreeA#merk.nodetype == leaf of
 	true ->
-	    [TreeA#merk.key,TreeB#merk.key];
+	    [TreeA#merk.userdata,TreeB#merk.userdata];
 	false ->
 	    diff3(TreeA,TreeB)
     end.
@@ -201,12 +244,14 @@ diff4a(KidsA,KidsB,Idx,Acc) ->
 	false ->
 	    case KidsA of
 		[] ->
-		    lists:append(Acc,lists:flatten([allkeys(X) || X <- KidsB]));
+		    lists:append(Acc,lists:flatten([allkeys(X) ||
+                                                       {_Okey, X} <- KidsB]));
 		_ ->
 		    case KidsB of
 			[] ->
 			    lists:append(Acc,lists:flatten(
-					       [allkeys(X) || X <- KidsA]));
+					       [allkeys(X) ||
+                                                   {_Okey, X} <- KidsA]));
 			_ ->
 			    diff4b(KidsA,KidsB,Idx,Acc)
 		    end
@@ -239,22 +284,25 @@ diff4b(KidsA,KidsB,Idx,Acc) ->
 	    end
     end.
 
-allkeys(Tree) ->
+% @spec allkeys(tree()) -> [userdata()]
+% @doc Produce all keys referenced in a Merkle tree.
+allkeys(undefined) -> [];
+allkeys(Tree) when is_record(Tree, merk) ->
     case Tree#merk.nodetype of
 	leaf ->
-	    [Tree#merk.key];
+	    [Tree#merk.userdata];
 	_ ->
 	    lists:flatten([allkeys(Kid) || Kid <- getkids(Tree)])
     end.
 	    
-allbutmaybe(Tree,Leaf) ->
+allbutmaybe(Tree,Leaf) when is_record(Tree, merk),is_record(Leaf,merk) ->
     % return all keys in Tree, maybe the one for Leaf
     % (depending on whether it is present&identical in Tree)
     case contains_node(Tree,Leaf) of
 	true ->
-	    lists:delete(Leaf#merk.key,allkeys(Tree));
+	    lists:delete(Leaf#merk.userdata,allkeys(Tree));
 	false ->
-	    lists:append([Leaf#merk.key],allkeys(Tree))
+	    lists:append([Leaf#merk.userdata],allkeys(Tree))
     end.
 
 contains_node(Tree,Node) ->
@@ -282,18 +330,20 @@ test_merkle() ->
 	 {four,"four data"},{five,"five data"}],
     B = [{one,"one data"},{two,"other two"},{three,"three data"},
 	 {four,"other four"},{five,"five data"}],
-    A1 = [{sha(K),sha(V)} || {K,V} <- A],
-    B1 = [{sha(K),sha(V)} || {K,V} <- B],
-    A2 = build_tree(A1),
-    B2 = build_tree(B1),
-    assert(diff(A2,B2), lists:usort([sha(X) || X <- [two, four]])),
+    A2 = build_tree(A),
+    B2 = build_tree(B),
+    assert(diff(A2,B2), lists:usort([two, four])),
     C = [{one,"one data"}],
-    C1 = [{sha(K),sha(V)} || {K,V} <- C],
-    C2 = build_tree(C1),
-    assert(diff(A2,C2), lists:usort([sha(X) || X <- [two, three, four, five]])),
-    D = insert({sha(four), sha("changed!")}, A2),
-    assert(diff(A2,D), [sha(four)]),
-    E = insert({sha(five), sha("changed more!")}, D),
-    assert(diff(D,E), [sha(five)]),
-    assert(diff(A2,E), lists:usort([sha(X) || X <- [four, five]])).
-
+    C2 = build_tree(C),
+    assert(diff(A2,C2), lists:usort([two, three, four, five])),
+    D = insert({four, sha("changed!")}, A2),
+    assert(diff(A2,D), [four]),
+    E = insert({five, sha("changed more!")}, D),
+    assert(diff(D,E), [five]),
+    assert(diff(A2,E), lists:usort([four, five])),
+    F = delete(five,D),
+    G = delete(five,E),
+    assert(diff(F,G), []),
+    H = delete(two,A2),
+    assert(diff(A2,H), [two]),
+    assert(diff(C2,undefined), [one]).
