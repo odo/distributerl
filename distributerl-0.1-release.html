@@ -26,6 +26,14 @@ The distributerl-0.1 release is driven by two improvements to the Merkle Tree mo
 Due to item #2, any systems making use of merkerl.erl should upgrade.
 <p>
 
+A couple of smaller handy features were also added:
+<ol>
+ <li>New function merkerl:delete/2 means that items can be deleted from trees.</li>
+ <li>New function merkerl:allkeys/1 will return the keys for all objects in a tree.</li>
+</ol>
+
+(The vclock and chash modules are unchanged in this release)
+
 Upcoming releases will include generic versioned objects, gossip protocol, and proper packing of the modules.
 
 <hr>
