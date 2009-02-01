@@ -42,7 +42,7 @@
 -module(merkerl).
 -export([insert/2,delete/2,build_tree/1,diff/2,test_merkle/0,allkeys/1]).
 
-% NOTE: userdata is the user-exposed key, 'key' is internal-only
+% TODO: fix doc, userdata is the ONLY user-exposed key
 -record(merk, {nodetype,           % atom: expected values are 'leaf' or 'inner'
                key=undefined,      % if nodetype=leaf, then this is binary/160
                                    % (keys are 160b binaries)
@@ -52,7 +52,7 @@
 	       children=undefined  % if nodetype=inner, then this is orddict
 	       }).
 
-% an internal-only form
+% TODO in doc: note that these are an internal-only form
 -record(merkitem, {userdata=undefined, % for non-binary "keys"
                    hkey,               % SHA-1 of userdata
                    hval                % SHA-1 of value (user-supplied)
@@ -69,25 +69,34 @@
 % @type treeinner() = term().
 % Not externally useful, this is one of two record types making up tree().
 
-% @type userdata().
+% (NEED TO EDOC THE RECORD TYPES)
+% The merkitem records...
+% These make up the "real" leaves in the Merkle tree.
+%
+% This is the input that most clients of the library will need to provide.
+
+% @type key() = binary().
 % This is the key, or "name" for an object tracked by a Merkle tree.
 % It should remain constant through changes to the object it references.
+% It is expected to be a 160b binary, as produced by
+% crypto:sha/1 -- if the natural names of objects are not such values,
+% then simply crypto:sha(term_to_binary(the-name>).
 
-% @type hash().
-% This is a unique value representing the content of an object tracked
-% by a Merkle tree.
+% @type hash() = binary().
+% This is a hash representing a unique content value for an object
+% tracked by a Merkle tree.
 % It should change if the object it references changes in value.
+% It is expected to be a 160b binary, as produced by
+% crypto:sha/1 -- crypto:sha(term_to_binary(value)) is the canonical
+% way to produce a hash().
 
-% @spec build_tree([{userdata(), hash()}]) -> tree()
-% @doc Build a Merkle tree from a list of pairs representing objects'
-%      names (keys) and hashes of their values.
+% %spec build_tree([kh()]) -> tree()
+% @doc Build a Merkle tree from a list of KH's of objects.
 build_tree([{K,H}]) ->
     insert({K,H},undefined);
 build_tree([{K,H}|KHL]) ->
     insert({K,H},build_tree(KHL)).
 
-% @spec delete(userdata(), tree()) -> tree()
-% @doc Remove the specified item from a tree.
 delete(Key, Tree) when is_record(Tree, merk) ->
     mi_delete({0, #merkitem{userdata=Key,hkey=sha(Key),hval=undefined}}, Tree).
 mi_delete({Offset, MI}, Tree) ->
@@ -114,16 +123,9 @@ mi_delete({Offset, MI}, Tree) ->
             mkinner(Offset,NewKids)
     end.
     
-% @spec insert(X :: {userdata(), hash()},T :: tree()) -> tree()
-% @doc Insert the data for a new or changed object X into T.
-%
-% userdata is any term; internally the key used is produced by
-% sha1(term_to_binary(userdata)).  When the value referenced by
-% a userdata key changes, then the userdata is expected not to change.
-%
-% the hash is expected to be a value that will only compare equal
-% (==) to another userdata key's hash if the values references by
-% those two keys is also equal.
+% TODO: fix @spec to be merkitems instead of kh's
+% spec insert(KH :: kh(),T :: tree()) -> tree()
+% @doc Insert the KH for a new or changed object into T.
 %
 % This is used much like a typical tree-insert function.
 % To create a new tree, this can be called with T set to the atom 'undefined'.
@@ -184,7 +186,8 @@ offset_key(Offset,Key) ->
     <<OKey:8/integer,_R/binary>> = RightKey,
     OKey.
 
-% @spec diff(tree(), tree()) -> [userdata()]
+% TODO FIX TO NOTE THAT WE RETURN USERDATA INSTEAD
+% @spec diff(tree(), tree()) -> [key()]
 % @doc Find the keys of objects which differ between the two trees.
 %
 % For this purpose, "differ" means that an object either exists in
@@ -193,8 +196,8 @@ offset_key(Offset,Key) ->
 %
 % No information about the differing objects is provided except the keys.
 % (Objects with vector-clock versioning are helpful here)
-diff(undefined, TreeB) -> allkeys(TreeB);
-diff(TreeA, undefined) -> allkeys(TreeA);
+diff(undefined, X) -> allkeys(X);
+diff(X, undefined) -> allkeys(X);
 diff(TreeA,TreeB) when is_record(TreeA,merk),is_record(TreeB,merk) ->
     % return the list of 'userdata' fields from inner nodes that differ
     lists:usort(diff1(TreeA,TreeB)).
@@ -249,7 +252,7 @@ diff4a(KidsA,KidsB,Idx,Acc) ->
 		_ ->
 		    case KidsB of
 			[] ->
-			    lists:append(Acc,lists:flatten(
+			    lists:append(Acc,lists:append(
 					       [allkeys(X) ||
                                                    {_Okey, X} <- KidsA]));
 			_ ->
@@ -284,15 +287,13 @@ diff4b(KidsA,KidsB,Idx,Acc) ->
 	    end
     end.
 
-% @spec allkeys(tree()) -> [userdata()]
-% @doc Produce all keys referenced in a Merkle tree.
 allkeys(undefined) -> [];
 allkeys(Tree) when is_record(Tree, merk) ->
     case Tree#merk.nodetype of
 	leaf ->
 	    [Tree#merk.userdata];
 	_ ->
-	    lists:flatten([allkeys(Kid) || Kid <- getkids(Tree)])
+	    lists:append([allkeys(Kid) || Kid <- getkids(Tree)])
     end.
 	    
 allbutmaybe(Tree,Leaf) when is_record(Tree, merk),is_record(Leaf,merk) ->
@@ -346,4 +347,9 @@ test_merkle() ->
     assert(diff(F,G), []),
     H = delete(two,A2),
     assert(diff(A2,H), [two]),
-    assert(diff(C2,undefined), [one]).
+    assert(diff(C2,undefined), [one]),
+    STree1 = build_tree([{"hello", "hi"},{"and", "what"}]),
+    STree2 = build_tree([{"hello", "hi"},{"goodbye", "bye"}]),
+    assert(diff(STree1, STree2), lists:usort(["and", "goodbye"])).
+
+
